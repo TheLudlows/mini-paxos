@@ -7,6 +7,7 @@ use std::sync::{Arc};
 use anyhow::anyhow;
 use log::info;
 use parking_lot::{Mutex, MutexGuard};
+use tokio::runtime::Runtime;
 use tonic::{IntoRequest, Request, Response, Status};
 use tonic::transport::Server;
 use crate::paxos::paxos_api::{Acceptor, BallotNum, PaxosInstanceId, Proposer, Value};
@@ -46,21 +47,19 @@ struct Version {
 
 
 
-pub async fn  start_servers(ids: &[i64]) -> anyhow::Result<Vec<Server>> {
-    std::env::set_var("RUST_LOG", "trace");
-    env_logger::init();
-    let mut servers = vec![];
+pub async fn  start_servers(ids: &[i64]) -> anyhow::Result<()> {
+    let rt = Runtime::new().expect("failed to obtain a new RunTime object");
+
     for i in ids {
         let address = format!("127.0.0.1:{}", 8000 + *i).parse()?;
         let paxos_service = PaxosService::default();
         let mut server = Server::builder();
-        server.add_service(paxos_api::paxos_kv_server::PaxosKvServer::new(paxos_service))
-            .serve(address)
-            .await?;
-        servers.push(server);
+        let f = server.add_service(paxos_api::paxos_kv_server::PaxosKvServer::new(paxos_service))
+            .serve(address);
+        rt.spawn(f);
     }
 
-    Ok(servers)
+    Ok(())
 }
 
 #[derive(Default, Clone)]
@@ -110,14 +109,44 @@ impl paxos_api::paxos_kv_server::PaxosKv for PaxosService {
     }
 }
 impl Proposer {
-    pub async fn run_paxos(&mut self, acceptorIds: &[i64], val: Value) -> Value {
+    pub async fn run_paxos(&mut self, acceptorIds: &[i64], mut val: Value) -> Value {
         let quorum = (acceptorIds.len() / 2 + 1) as i32;
         loop {
             let r =  self.ph1(acceptorIds, quorum).await;
             if r.is_err() {
+                info!("ph1 error ");
+
                 self.bal.unwrap().n += 1;
                 continue;
             }
+            let (max_val, high_bal, err) = r.unwrap();
+            if err.is_some() {
+                self.bal.unwrap().n += 1;
+                continue;
+            }
+
+            if max_val.is_none() {
+                info!("Proposer: no voted value seen, propose my value: {:?}", val);
+            }else {
+                val = max_val.unwrap()
+            }
+            self.val = Some(val);
+            info!("Proposer: proposer chose value to propose: {:?}", val);
+
+            let r = self.ph2(&acceptorIds, quorum).await;
+            if r.is_err() {
+                info!("ph2 error ");
+                self.bal.unwrap().n += 1;
+                continue;
+            }
+            let (bal, err) = r.unwrap();
+            if err.is_some() {
+                self.bal.unwrap().n += 1;
+                continue;
+            }
+           info!("Proposer: value is voted by a quorum and has been safe: {:?}", max_val);
+            return self.val.unwrap();
+
         }
 
     }
@@ -148,7 +177,7 @@ impl Proposer {
         Ok((None, Some(higher_bal), Some(NotEnoughQuorum)))
     }
 
-    pub async fn ph2(&self, acceptors: Vec<i64>, quorum: i32) -> anyhow::Result<(Option<BallotNum>, Option<PaxosError>)> {
+    pub async fn ph2(&self, acceptors: &[i64], quorum: i32) -> anyhow::Result<(Option<BallotNum>, Option<PaxosError>)> {
         let accs = self.rpc_to_all(&acceptors, ph2).await?;
         let mut ok = 0;
         let mut higher_bal = BallotNum::default();
