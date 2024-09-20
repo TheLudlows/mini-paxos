@@ -4,14 +4,18 @@ use std::fmt::format;
 use thiserror::Error;
 
 use std::sync::{Arc};
-use anyhow::anyhow;
-use log::info;
+use anyhow::{anyhow, Error};
+use futures::{join, try_join};
+use futures::future::join_all;
+use log::{error, info};
 use parking_lot::{Mutex, MutexGuard};
+use tokio::io::join;
 use tokio::runtime::Runtime;
 use tonic::{IntoRequest, Request, Response, Status};
 use tonic::transport::Server;
 use crate::paxos::paxos_api::{Acceptor, BallotNum, PaxosInstanceId, Proposer, Value};
 use crate::paxos::paxos_api::paxos_kv_client::PaxosKvClient;
+use crate::paxos::paxos_api::paxos_kv_server::PaxosKvServer;
 use crate::paxos::PaxosError::NotEnoughQuorum;
 use crate::paxos::RpcType::{ph1, ph2};
 
@@ -46,27 +50,27 @@ struct Version {
 }
 
 
-
-pub async fn  start_servers(ids: &[i64]) -> anyhow::Result<()> {
-    let rt = Runtime::new().expect("failed to obtain a new RunTime object");
-
-    for i in ids {
-        let address = format!("127.0.0.1:{}", 8000 + *i).parse()?;
-        let paxos_service = PaxosService::default();
-        let mut server = Server::builder();
-        let f = server.add_service(paxos_api::paxos_kv_server::PaxosKvServer::new(paxos_service))
-            .serve(address);
-        rt.spawn(f);
-    }
-
+pub async fn start_server(id: i64) -> anyhow::Result<()> {
+    let address = format!("127.0.0.1:{}", 8000 + id).parse()?;
+    let paxos_service = PaxosService::new(id);
+    info!("start server {}!", id);
+    Server::builder().add_service(PaxosKvServer::new(paxos_service))
+        .serve(address).await?;
     Ok(())
 }
 
 #[derive(Default, Clone)]
 pub struct PaxosService {
+    server_id: i64,
     kv: Arc<Mutex<HashMap<String, Versions>>>,
 }
 impl PaxosService {
+    pub fn new(id: i64) -> Self {
+        Self {
+            server_id: id,
+            kv: Arc::new(Default::default()),
+        }
+    }
     pub fn get_version(&self, id: PaxosInstanceId) -> ArcVersion {
         let mut kv = self.kv.lock();
         let key = &id.key;
@@ -81,20 +85,22 @@ impl PaxosService {
 #[tonic::async_trait]
 impl paxos_api::paxos_kv_server::PaxosKv for PaxosService {
     async fn prepare(&self, request: Request<Proposer>) -> Result<Response<Acceptor>, Status> {
-        info!("receive prepared req {:?}", request);
+        info!("Server {} receive prepared {:?}", self.server_id, request.get_ref());
         let p = request.into_inner();
         let lock = self.get_version(p.id.unwrap());
         let mut v = lock.lock();
         let mut val = &mut v.val;
+        info!("old val is {:?}", val);
         if p.bal >= val.last_bal
         {
             val.last_bal = p.bal;
         }
+
         Ok(Response::new(val.clone()))
     }
 
     async fn accept(&self, request: Request<Proposer>) -> Result<Response<Acceptor>, Status> {
-        info!("receive accept req {:?}", request);
+        info!("Server {} receive accept {:?}", self.server_id, request.get_ref());
         let p = request.into_inner();
         let lock = self.get_version(p.id.unwrap());
         let mut v = lock.lock();
@@ -109,61 +115,48 @@ impl paxos_api::paxos_kv_server::PaxosKv for PaxosService {
     }
 }
 impl Proposer {
-    pub async fn run_paxos(&mut self, acceptorIds: &[i64], mut val: Value) -> Value {
-        let quorum = (acceptorIds.len() / 2 + 1) as i32;
+    pub async fn run_paxos(&mut self, acceptor_ids: &[i64], val: Option<Value>) -> Option<Value> {
+        let quorum = (acceptor_ids.len() / 2 + 1) as i32;
+        self.val = val;
         loop {
-            let r =  self.ph1(acceptorIds, quorum).await;
+            let r = self.ph1(acceptor_ids, quorum).await;
             if r.is_err() {
-                info!("ph1 error ");
-
-                self.bal.unwrap().n += 1;
+                error!("Proposer: ph1 error {:?}", r);
+                self.bal?.n += 1;
                 continue;
             }
-            let (max_val, high_bal, err) = r.unwrap();
-            if err.is_some() {
-                self.bal.unwrap().n += 1;
-                continue;
-            }
-
+            let (max_val, high_bal) = r.unwrap();
             if max_val.is_none() {
                 info!("Proposer: no voted value seen, propose my value: {:?}", val);
-            }else {
-                val = max_val.unwrap()
+            } else {
+                self.val = max_val;
             }
-            self.val = Some(val);
             info!("Proposer: proposer chose value to propose: {:?}", val);
+            if self.val.is_none() {
+                return None;
+            }
 
-            let r = self.ph2(&acceptorIds, quorum).await;
+            let r = self.ph2(&acceptor_ids, quorum).await;
             if r.is_err() {
                 info!("ph2 error ");
-                self.bal.unwrap().n += 1;
+                self.bal?.n += 1;
                 continue;
             }
-            let (bal, err) = r.unwrap();
-            if err.is_some() {
-                self.bal.unwrap().n += 1;
-                continue;
-            }
-           info!("Proposer: value is voted by a quorum and has been safe: {:?}", max_val);
-            return self.val.unwrap();
-
+            info!("Proposer: value is voted by a quorum and has been safe: {:?}",  self.val);
+            return self.val;
         }
-
     }
-    pub async fn ph1(&self, acceptors:&[i64], quorum: i32) -> anyhow::Result<(Option<Value>, Option<BallotNum>, Option<PaxosError>)> {
+    pub async fn ph1(&self, acceptors: &[i64], quorum: i32) -> anyhow::Result<(Option<Value>, Option<BallotNum>)> {
         let accs = self.rpc_to_all(&acceptors, ph1).await?;
         let mut max_bal = &accs[0];
         let mut ok = 0;
-        let mut higher_bal = BallotNum::default();
+        let mut higher_bal = self.bal;
 
         for acc in accs.iter() {
-            info!("Proposer: handling Prepare reply: {:?}", acc);
-            if self.bal.lt(&acc.last_bal)
+            info!("Proposer: handling prepare reply: {:?}", acc);
+            if higher_bal.lt(&acc.last_bal)
             {
-                if acc.last_bal.unwrap().ge(&higher_bal)
-                {
-                    higher_bal = acc.last_bal.unwrap();
-                }
+                higher_bal = acc.last_bal;
                 continue;
             }
             ok += 1;
@@ -171,38 +164,35 @@ impl Proposer {
                 max_bal = acc;
             }
             if ok == quorum {
-                return Ok((max_bal.val, None, None));
+                return Ok((max_bal.val, None));
             }
         }
-        Ok((None, Some(higher_bal), Some(NotEnoughQuorum)))
+        Err(Error::from(NotEnoughQuorum))
     }
 
-    pub async fn ph2(&self, acceptors: &[i64], quorum: i32) -> anyhow::Result<(Option<BallotNum>, Option<PaxosError>)> {
+    pub async fn ph2(&self, acceptors: &[i64], quorum: i32) -> anyhow::Result<Option<BallotNum>> {
         let accs = self.rpc_to_all(&acceptors, ph2).await?;
         let mut ok = 0;
-        let mut higher_bal = BallotNum::default();
+        let mut higher_bal = self.bal;
         for acc in accs.iter() {
             info!("Proposer: handling Accept reply:{:?}", acc);
-            if self.bal.lt(&acc.last_bal) {
-                if (acc.last_bal.unwrap().ge(&higher_bal))
-                {
-                    higher_bal = acc.last_bal.unwrap();
-                }
+            if higher_bal.lt(&acc.last_bal) {
+                higher_bal = acc.last_bal;
                 continue;
             }
             ok += 1;
             if ok == quorum {
-                return Ok((None, None));
+                return Ok(None);
             }
         }
-        Ok((Some(higher_bal), Some(NotEnoughQuorum)))
+        Err(Error::from(NotEnoughQuorum))
     }
 
 
     pub async fn rpc_to_all(&self, acceptors: &[i64], rpc_type: RpcType) -> anyhow::Result<Vec<Acceptor>> {
         let mut acceptor_vec = Vec::new();
         for id in acceptors.iter() {
-            let address = format!("127.0.0.1:{}", id);
+            let address = format!("http://127.0.0.1:{}", 8000 + *id);
             let mut client = PaxosKvClient::connect(address).await?;
             let res = if rpc_type == ph1 {
                 client.prepare(Request::new(self.clone())).await
